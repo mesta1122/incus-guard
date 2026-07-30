@@ -5,11 +5,9 @@ incudal  一键监测滥用-自动封禁脚本
 
 ## 一键安装
 
-Incudal 一键监测滥用 - 自动封禁脚本
-
-​```bash
+\`\`\`bash
 curl -fsSL https://raw.githubusercontent.com/mesta1122/incus-guard/main/install_incus_guard.sh | sudo bash
-​```
+\`\`\`
 
 ## 常用参数
 
