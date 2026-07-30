@@ -419,7 +419,6 @@ cat > "$GUA_BIN" << GUA_EOF
 set -u
 LOG_DIR="$LOG_DIR"
 LOG="\$LOG_DIR/incus_guard.log"
-EXPIRE_LOG="\$LOG_DIR/incus-expire.log"
 BAN_FILE="/run/incus_guard.bans"
 INSTALLER_PATH="$INSTALLER_PATH"
 REMOTE_INSTALL_URL="$REMOTE_INSTALL_URL"
@@ -458,9 +457,11 @@ validate_date() {
   date -d "\$1" >/dev/null 2>&1
 }
 
+declare -gA IDX_NAME
+
 list_instances_table() {
-  local i=1
-  declare -gA IDX_NAME
+  IDX_NAME=()
+  local idx=1
   printf "%-4s %-20s %-16s %-12s\n" "编号" "实例名称" "内网IP" "到期时间"
   echo "--------------------------------------------------------------"
   while read -r NAME; do
@@ -469,9 +470,9 @@ list_instances_table() {
     [ -z "\$IP" ] && IP="无"
     EXP="\$(get_expire_for "\$NAME")"
     [ -z "\$EXP" ] && EXP="无"
-    printf "%-4s %-20s %-16s %-12s\n" "\$i" "\$NAME" "\$IP" "\$EXP"
-    IDX_NAME[\$i]="\$NAME"
-    i=\$((i+1))
+    printf "%-4s %-20s %-16s %-12s\n" "\$idx" "\$NAME" "\$IP" "\$EXP"
+    IDX_NAME[\$idx]="\$NAME"
+    idx=\$((idx+1))
   done < <(incus list --format csv -c n 2>/dev/null)
 }
 
@@ -492,7 +493,11 @@ expire_menu() {
         echo
         list_instances_table
         echo
-        total=\$((i-1))
+        if [ "\${#IDX_NAME[@]}" -eq 0 ]; then
+          echo "未检测到任何实例"
+          pause
+          continue
+        fi
         read -rp "请输入主机编号 [1-\${#IDX_NAME[@]}]: " num
         if [ -z "\${IDX_NAME[\$num]:-}" ]; then
           echo "无效编号"
