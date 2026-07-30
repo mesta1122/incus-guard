@@ -8,7 +8,7 @@
 set -euo pipefail
 
 # ===== 【必改】改成你自己的 GitHub raw 地址或短链，用于 gua 菜单里的"脚本升级" =====
-REMOTE_INSTALL_URL="REMOTE_INSTALL_URL="https://raw.githubusercontent.com/mesta1122/incus-guard/main/install_incus_guard.sh"
+REMOTE_INSTALL_URL="https://raw.githubusercontent.com/mesta1122/incus-guard/main/install_incus_guard.sh"
 
 SCRIPT_PATH="/usr/local/sbin/incus-guard-v2.sh"
 INSTALLER_PATH="/usr/local/sbin/install_incus_guard.sh"
