@@ -12,6 +12,7 @@ GUA_BIN="/usr/local/bin/gua"
 LOG_DIR="/var/log/incus-guard"
 EXPIRE_DATA_DIR="/etc/incus-expire"
 EXPIRE_DATA_FILE="$EXPIRE_DATA_DIR/expire.list"
+EXPIRE_BAN_FILE="$EXPIRE_DATA_DIR/expire_bans.list"
 SYSTEMD_SERVICE="/etc/systemd/system/incus-guard.service"
 SYSTEMD_TIMER="/etc/systemd/system/incus-guard.timer"
 EXPIRE_SERVICE="/etc/systemd/system/incus-expire.service"
@@ -39,7 +40,7 @@ rm -f "$SYSTEMD_SERVICE" "$SYSTEMD_TIMER" "$EXPIRE_SERVICE" "$EXPIRE_TIMER"
 systemctl daemon-reload
 echo "==> 移除主脚本与管理命令（日志和到期数据保留）"
 rm -f "$SCRIPT_PATH" "$EXPIRE_CHECK_PATH" "$GUA_BIN" "$INSTALLER_PATH"
-echo "完成。如需清理 iptables 规则，请手动检查 iptables -L INCUS_GUARD -n"
+echo "完成。如需清理 iptables 规则，请手动检查 iptables -L INCUS_GUARD -n 与 iptables -L INCUS_EXPIRE_GUARD -n"
 }
 
 if [ "$MODE" = "uninstall" ]; then
@@ -71,7 +72,7 @@ chmod 750 "$INSTALLER_PATH"
 
 echo "==> 创建数据/日志目录"
 install -d -m 755 "$LOG_DIR" "$EXPIRE_DATA_DIR"
-touch "$EXPIRE_DATA_FILE"
+touch "$EXPIRE_DATA_FILE" "$EXPIRE_BAN_FILE"
 
 echo "==> 写入出站滥用检测脚本 $SCRIPT_PATH"
 install -d -m 755 "$(dirname "$SCRIPT_PATH")"
@@ -86,24 +87,21 @@ TH_PORTS=${TH_PORTS:-50}
 TH_TOTAL=${TH_TOTAL:-1000}
 TH_SYN_SENT=${TH_SYN_SENT:-150}
 
-STOP_DST_IP=${STOP_DST_IP:-250}
-STOP_PORTS=${STOP_PORTS:-120}
-STOP_TOTAL=${STOP_TOTAL:-3000}
-STOP_SYN_SENT=${STOP_SYN_SENT:-500}
-
 COOLDOWN_SECONDS=${COOLDOWN_SECONDS:-1800}
 BAN_SECONDS=${BAN_SECONDS:-86400}
 DRY_RUN=${DRY_RUN:-0}
+ABUSE_BAN_THRESHOLD=${ABUSE_BAN_THRESHOLD:-2}
 
 LOG_DIR="/var/log/incus-guard"
 LOG="$LOG_DIR/incus_guard.log"
 COOLDOWN_FILE="/run/incus_guard.cooldown"
 BAN_FILE="/run/incus_guard.bans"
+ABUSE_COUNT_FILE="/var/log/incus-guard/abuse_count.list"
 LOCK_FILE="/run/incus_guard.lock"
 BAN_CHAIN="INCUS_GUARD"
 
 mkdir -p "$LOG_DIR"
-touch "$COOLDOWN_FILE" "$BAN_FILE"
+touch "$COOLDOWN_FILE" "$BAN_FILE" "$ABUSE_COUNT_FILE"
 
 log() {
 printf '[%s] %s\n' "$(date '+%F %T')" "$*" >> "$LOG"
@@ -160,6 +158,7 @@ else
 "$IPTABLES" -D "$BAN_CHAIN" -s "$ip" -j DROP 2>/dev/null || true
 fi
 log "unban expired $name $ip"
+reset_abuse_count "$name"
 else
 printf '%s %s %s\n' "$name" "$ip" "$ts" >> "$tmp"
 fi
@@ -194,6 +193,30 @@ tmp="$(mktemp)"
 awk -v n="$name" '$1 != n { print }' "$COOLDOWN_FILE" 2>/dev/null > "$tmp" || true
 printf '%s %s\n' "$name" "$now" >> "$tmp"
 mv "$tmp" "$COOLDOWN_FILE"
+}
+
+get_abuse_count() {
+local name="$1"
+awk -v n="$name" '$1 == n { print $2; exit }' "$ABUSE_COUNT_FILE" 2>/dev/null
+}
+
+inc_abuse_count() {
+local name="$1" cur new tmp
+cur="$(get_abuse_count "$name")"
+[ -z "$cur" ] && cur=0
+new=$((cur + 1))
+tmp="$(mktemp)"
+awk -v n="$name" '$1 != n { print }' "$ABUSE_COUNT_FILE" 2>/dev/null > "$tmp" || true
+printf '%s %s\n' "$name" "$new" >> "$tmp"
+mv "$tmp" "$ABUSE_COUNT_FILE"
+echo "$new"
+}
+
+reset_abuse_count() {
+local name="$1" tmp
+tmp="$(mktemp)"
+awk -v n="$name" '$1 != n { print }' "$ABUSE_COUNT_FILE" 2>/dev/null > "$tmp" || true
+mv "$tmp" "$ABUSE_COUNT_FILE"
 }
 
 get_field() {
@@ -284,28 +307,25 @@ fi
 set_cooldown "$NAME"
 save_evidence "$NAME" "$IP"
 
-ACTION="freeze"
-if [ "$TOTAL" -gt "$STOP_TOTAL" ] || \
-[ "$DST_IP" -gt "$STOP_DST_IP" ] || \
-[ "$PORTS" -gt "$STOP_PORTS" ] || \
-[ "$SYN_SENT" -gt "$STOP_SYN_SENT" ]; then
-ACTION="stop"
-fi
-
-ban_ip "$IP"
-record_ban "$NAME" "$IP" "$(date +%s)"
+COUNT="$(inc_abuse_count "$NAME")"
+log "$NAME 累计滥用次数: $COUNT"
 
 if [ "$DRY_RUN" = "1" ]; then
-log "[DRY_RUN] would $ACTION $NAME"
+if [ "$COUNT" -ge "$ABUSE_BAN_THRESHOLD" ]; then
+log "[DRY_RUN] would ban $IP and stop $NAME (第 $COUNT 次滥用)"
+else
+log "[DRY_RUN] would stop $NAME (第 $COUNT 次滥用)"
+fi
 continue
 fi
 
-if [ "$ACTION" = "stop" ]; then
-log "STOP $NAME"
+log "STOP $NAME (第 $COUNT 次滥用)"
 incus stop "$NAME" --timeout 10 --force >> "$LOG" 2>&1 || true
-else
-log "FREEZE $NAME"
-incus freeze "$NAME" >> "$LOG" 2>&1 || true
+
+if [ "$COUNT" -ge "$ABUSE_BAN_THRESHOLD" ]; then
+log "BAN $NAME ip=$IP (达到封禁阈值 $ABUSE_BAN_THRESHOLD)"
+ban_ip "$IP"
+record_ban "$NAME" "$IP" "$(date +%s)"
 fi
 done
 
@@ -319,14 +339,39 @@ cat > "$EXPIRE_CHECK_PATH" << 'EXPIRE_EOF'
 set -u
 
 DATA_FILE="/etc/incus-expire/expire.list"
+EXPIRE_BAN_FILE="/etc/incus-expire/expire_bans.list"
 LOG_FILE="/var/log/incus-guard/incus-expire.log"
 LOCK_FILE="/run/incus-expire.lock"
+EXPIRE_CHAIN="INCUS_EXPIRE_GUARD"
 
 exec 9>"$LOCK_FILE"
 flock -n 9 || exit 0
 
 log() {
 printf '[%s] %s\n' "$(date '+%F %T')" "$*" >> "$LOG_FILE"
+}
+
+touch "$EXPIRE_BAN_FILE"
+
+IPTABLES="$(command -v iptables || true)"
+
+ensure_chain() {
+[ -n "$IPTABLES" ] || return 1
+"$IPTABLES" -N "$EXPIRE_CHAIN" 2>/dev/null || true
+"$IPTABLES" -C FORWARD -j "$EXPIRE_CHAIN" 2>/dev/null || \
+"$IPTABLES" -I FORWARD 1 -j "$EXPIRE_CHAIN"
+}
+
+ban_ip() {
+local ip="$1"
+[ -n "$IPTABLES" ] || return 0
+ensure_chain || return 0
+"$IPTABLES" -C "$EXPIRE_CHAIN" -s "$ip" -j DROP 2>/dev/null || \
+"$IPTABLES" -A "$EXPIRE_CHAIN" -s "$ip" -j DROP
+}
+
+get_ipv4() {
+incus list "$1" --format csv -c 4 2>/dev/null | grep -oE '([0-9]{1,3}\.){3}[0-9]{1,3}' | head -n 1
 }
 
 [ -s "$DATA_FILE" ] || exit 0
@@ -338,7 +383,7 @@ while read -r NAME EXPIRE; do
 [ -z "${NAME:-}" ] && continue
 [ -z "${EXPIRE:-}" ] && continue
 
-EXPIRE_TS="$(date -d "$EXPIRE" +%s 2>/dev/null || echo 0)"
+EXPIRE_TS="$(date -d "$EXPIRE 23:59:59" +%s 2>/dev/null || echo 0)"
 if [ "$EXPIRE_TS" -eq 0 ]; then
 printf '%s %s\n' "$NAME" "$EXPIRE" >> "$TMP"
 continue
@@ -346,9 +391,17 @@ fi
 
 if [ "$TODAY_TS" -ge "$EXPIRE_TS" ]; then
 STATE="$(incus list "$NAME" --format csv -c s 2>/dev/null | head -n1)"
+IP="$(get_ipv4 "$NAME")"
+
 if [ "$STATE" = "RUNNING" ]; then
 log "实例 $NAME 已到期($EXPIRE)，正在关机"
 incus stop "$NAME" --timeout 30 >> "$LOG_FILE" 2>&1 || true
+fi
+
+if [ -n "$IP" ] && ! grep -q "^$NAME " "$EXPIRE_BAN_FILE" 2>/dev/null; then
+log "实例 $NAME 到期封禁 IP $IP"
+ban_ip "$IP"
+printf '%s %s\n' "$NAME" "$IP" >> "$EXPIRE_BAN_FILE"
 fi
 fi
 printf '%s %s\n' "$NAME" "$EXPIRE" >> "$TMP"
@@ -420,9 +473,13 @@ set -u
 LOG_DIR="$LOG_DIR"
 LOG="\$LOG_DIR/incus_guard.log"
 BAN_FILE="/run/incus_guard.bans"
+ABUSE_COUNT_FILE="\$LOG_DIR/abuse_count.list"
 INSTALLER_PATH="$INSTALLER_PATH"
 REMOTE_INSTALL_URL="$REMOTE_INSTALL_URL"
 EXPIRE_DATA_FILE="$EXPIRE_DATA_FILE"
+EXPIRE_BAN_FILE="$EXPIRE_BAN_FILE"
+EXPIRE_CHAIN="INCUS_EXPIRE_GUARD"
+ABUSE_CHAIN="INCUS_GUARD"
 
 status_line() {
   if systemctl is-active --quiet incus-guard.timer; then
@@ -445,16 +502,43 @@ get_expire_for() {
   awk -v n="\$name" '\$1 == n { print \$2; exit }' "\$EXPIRE_DATA_FILE" 2>/dev/null
 }
 
+validate_date() {
+  date -d "\$1" >/dev/null 2>&1
+}
+
+unban_expire_and_start() {
+  local name="\$1"
+  local ip
+  ip="\$(grep "^\$name " "\$EXPIRE_BAN_FILE" 2>/dev/null | awk '{print \$2}')"
+  if [ -n "\$ip" ]; then
+    iptables -D "\$EXPIRE_CHAIN" -s "\$ip" -j DROP 2>/dev/null || true
+    local tmp
+    tmp="\$(mktemp)"
+    grep -v "^\$name " "\$EXPIRE_BAN_FILE" 2>/dev/null > "\$tmp" || true
+    mv "\$tmp" "\$EXPIRE_BAN_FILE"
+    echo "已解除到期封禁 IP: \$ip"
+  fi
+  local state
+  state="\$(incus list "\$name" --format csv -c s 2>/dev/null | head -n1)"
+  if [ "\$state" != "RUNNING" ]; then
+    incus start "\$name" >/dev/null 2>&1 || true
+    echo "已自动开机: \$name"
+  fi
+}
+
 set_expire_for() {
   local name="\$1" date="\$2" tmp
   tmp="\$(mktemp)"
   awk -v n="\$name" '\$1 != n { print }' "\$EXPIRE_DATA_FILE" 2>/dev/null > "\$tmp" || true
   printf '%s %s\n' "\$name" "\$date" >> "\$tmp"
   mv "\$tmp" "\$EXPIRE_DATA_FILE"
-}
 
-validate_date() {
-  date -d "\$1" >/dev/null 2>&1
+  local new_ts now_ts
+  new_ts="\$(date -d "\$date 23:59:59" +%s 2>/dev/null || echo 0)"
+  now_ts="\$(date +%s)"
+  if [ "\$new_ts" -gt "\$now_ts" ]; then
+    unban_expire_and_start "\$name"
+  fi
 }
 
 declare -gA IDX_NAME
@@ -528,6 +612,71 @@ expire_menu() {
   done
 }
 
+declare -gA BANNED_IDX_NAME
+declare -gA BANNED_IDX_IP
+
+list_banned_table() {
+  BANNED_IDX_NAME=()
+  BANNED_IDX_IP=()
+  local idx=1
+  printf "%-4s %-20s %-16s\n" "编号" "主机名称" "内网IP"
+  echo "----------------------------------------"
+  if [ ! -s "\$BAN_FILE" ]; then
+    echo "暂无滥用封禁记录"
+    return
+  fi
+  while read -r NAME IP TS; do
+    [ -z "\${NAME:-}" ] && continue
+    printf "%-4s %-20s %-16s\n" "\$idx" "\$NAME" "\$IP"
+    BANNED_IDX_NAME[\$idx]="\$NAME"
+    BANNED_IDX_IP[\$idx]="\$IP"
+    idx=\$((idx+1))
+  done < "\$BAN_FILE"
+}
+
+reset_abuse_count() {
+  local name="\$1" tmp
+  tmp="\$(mktemp)"
+  awk -v n="\$name" '\$1 != n { print }' "\$ABUSE_COUNT_FILE" 2>/dev/null > "\$tmp" || true
+  mv "\$tmp" "\$ABUSE_COUNT_FILE"
+}
+
+unban_menu() {
+  while true; do
+    clear
+    echo "================================"
+    echo "   滥用封禁解除"
+    echo "================================"
+    list_banned_table
+    echo "================================"
+    echo "输入编号解封对应主机，输入 0 返回上级菜单"
+    read -rp "请选择: " num
+
+    if [ "\$num" = "0" ]; then
+      return
+    fi
+
+    if [ -z "\${BANNED_IDX_NAME[\$num]:-}" ]; then
+      echo "无效编号"
+      sleep 1
+      continue
+    fi
+
+    local name ip tmp
+    name="\${BANNED_IDX_NAME[\$num]}"
+    ip="\${BANNED_IDX_IP[\$num]}"
+
+    iptables -D "\$ABUSE_CHAIN" -s "\$ip" -j DROP 2>/dev/null || true
+    tmp="\$(mktemp)"
+    grep -v " \$ip " "\$BAN_FILE" 2>/dev/null > "\$tmp" || true
+    mv "\$tmp" "\$BAN_FILE"
+    reset_abuse_count "\$name"
+
+    echo "已解封: \$name (\$ip)，滥用计数已清零"
+    pause
+  done
+}
+
 while true; do
   clear
   echo "================================"
@@ -537,10 +686,11 @@ while true; do
   echo "1. 脚本升级（拉取最新版本并重装）"
   echo "2. 封禁日志"
   echo "3. 实例到期管理"
-  echo "4. 删除脚本（完全卸载）"
-  echo "5. 退出"
+  echo "4. 滥用封禁解除"
+  echo "5. 删除脚本（完全卸载）"
+  echo "6. 退出"
   echo "================================"
-  read -rp "请输入选项 [1-5]: " choice
+  read -rp "请输入选项 [1-6]: " choice
 
   case "\$choice" in
     1)
@@ -570,15 +720,21 @@ while true; do
       expire_menu
       ;;
     4)
-      read -rp "确认要完全卸载 incus-guard 吗？(y/N): " confirm
-      if [ "\$confirm" = "y" ] || [ "\$confirm" = "Y" ]; then
+      unban_menu
+      ;;
+    5)
+      read -rp "确认要完全卸载 incus-guard 吗？此操作不可逆，请输入大写 Y 确认: " confirm
+      if [ "\$confirm" = "Y" ]; then
         bash "\$INSTALLER_PATH" --uninstall
         echo "已卸载。gua 命令即将失效。"
         pause
         exit 0
+      else
+        echo "已取消卸载"
+        pause
       fi
       ;;
-    5)
+    6)
       exit 0
       ;;
     *)
@@ -592,7 +748,7 @@ chmod 755 "$GUA_BIN"
 
 echo
 echo "==> 安装完成"
-[ "$DRY_RUN_FLAG" = "1" ] && echo "  当前为 DRY_RUN 模式：只记日志，不会 freeze/stop/封禁"
+[ "$DRY_RUN_FLAG" = "1" ] && echo "  当前为 DRY_RUN 模式：只记日志，不会 stop/封禁"
 echo "  root 下输入 gua 打开管理面板"
 echo "  状态: systemctl status incus-guard.timer"
 echo "  到期检查状态: systemctl status incus-expire.timer"
