@@ -1,21 +1,21 @@
 #!/usr/bin/env bash
 # install_incus_guard.sh
-# 一键部署 incus-guard-v2.sh + gua 管理命令
-# 用法：
-#   curl -fsSL https://你的短链/install.sh | sudo bash
-#   sudo bash install_incus_guard.sh --dry-run
-#   sudo bash install_incus_guard.sh --uninstall
+# 一键部署 incus-guard-v2.sh + incus-expire-check.sh + gua 管理命令
 set -euo pipefail
 
-# ===== 【必改】改成你自己的 GitHub raw 地址或短链，用于 gua 菜单里的"脚本升级" =====
 REMOTE_INSTALL_URL="https://raw.githubusercontent.com/mesta1122/incus-guard/main/install_incus_guard.sh"
 
 SCRIPT_PATH="/usr/local/sbin/incus-guard-v2.sh"
+EXPIRE_CHECK_PATH="/usr/local/sbin/incus-expire-check.sh"
 INSTALLER_PATH="/usr/local/sbin/install_incus_guard.sh"
 GUA_BIN="/usr/local/bin/gua"
 LOG_DIR="/var/log/incus-guard"
+EXPIRE_DATA_DIR="/etc/incus-expire"
+EXPIRE_DATA_FILE="$EXPIRE_DATA_DIR/expire.list"
 SYSTEMD_SERVICE="/etc/systemd/system/incus-guard.service"
 SYSTEMD_TIMER="/etc/systemd/system/incus-guard.timer"
+EXPIRE_SERVICE="/etc/systemd/system/incus-expire.service"
+EXPIRE_TIMER="/etc/systemd/system/incus-expire.timer"
 
 MODE="install"
 DRY_RUN_FLAG=0
@@ -34,10 +34,11 @@ fi
 uninstall_all() {
 echo "==> 停止并移除 systemd timer/service"
 systemctl disable --now incus-guard.timer 2>/dev/null || true
-rm -f "$SYSTEMD_SERVICE" "$SYSTEMD_TIMER"
+systemctl disable --now incus-expire.timer 2>/dev/null || true
+rm -f "$SYSTEMD_SERVICE" "$SYSTEMD_TIMER" "$EXPIRE_SERVICE" "$EXPIRE_TIMER"
 systemctl daemon-reload
-echo "==> 移除主脚本与管理命令（日志保留）"
-rm -f "$SCRIPT_PATH" "$GUA_BIN" "$INSTALLER_PATH"
+echo "==> 移除主脚本与管理命令（日志和到期数据保留）"
+rm -f "$SCRIPT_PATH" "$EXPIRE_CHECK_PATH" "$GUA_BIN" "$INSTALLER_PATH"
 echo "完成。如需清理 iptables 规则，请手动检查 iptables -L INCUS_GUARD -n"
 }
 
@@ -68,7 +69,11 @@ install -d -m 755 "$(dirname "$INSTALLER_PATH")"
 cp -f "$0" "$INSTALLER_PATH" 2>/dev/null || curl -fsSL "$REMOTE_INSTALL_URL" -o "$INSTALLER_PATH"
 chmod 750 "$INSTALLER_PATH"
 
-echo "==> 写入主脚本 $SCRIPT_PATH"
+echo "==> 创建数据/日志目录"
+install -d -m 755 "$LOG_DIR" "$EXPIRE_DATA_DIR"
+touch "$EXPIRE_DATA_FILE"
+
+echo "==> 写入出站滥用检测脚本 $SCRIPT_PATH"
 install -d -m 755 "$(dirname "$SCRIPT_PATH")"
 cat > "$SCRIPT_PATH" << 'GUARD_EOF'
 #!/usr/bin/env bash
@@ -308,10 +313,52 @@ log "===== END ====="
 GUARD_EOF
 chmod 750 "$SCRIPT_PATH"
 
-echo "==> 创建日志目录 $LOG_DIR"
-install -d -m 755 "$LOG_DIR"
+echo "==> 写入到期检查脚本 $EXPIRE_CHECK_PATH"
+cat > "$EXPIRE_CHECK_PATH" << 'EXPIRE_EOF'
+#!/usr/bin/env bash
+set -u
 
-echo "==> 写入 systemd service"
+DATA_FILE="/etc/incus-expire/expire.list"
+LOG_FILE="/var/log/incus-guard/incus-expire.log"
+LOCK_FILE="/run/incus-expire.lock"
+
+exec 9>"$LOCK_FILE"
+flock -n 9 || exit 0
+
+log() {
+printf '[%s] %s\n' "$(date '+%F %T')" "$*" >> "$LOG_FILE"
+}
+
+[ -s "$DATA_FILE" ] || exit 0
+
+TODAY_TS="$(date +%s)"
+TMP="$(mktemp)"
+
+while read -r NAME EXPIRE; do
+[ -z "${NAME:-}" ] && continue
+[ -z "${EXPIRE:-}" ] && continue
+
+EXPIRE_TS="$(date -d "$EXPIRE" +%s 2>/dev/null || echo 0)"
+if [ "$EXPIRE_TS" -eq 0 ]; then
+printf '%s %s\n' "$NAME" "$EXPIRE" >> "$TMP"
+continue
+fi
+
+if [ "$TODAY_TS" -ge "$EXPIRE_TS" ]; then
+STATE="$(incus list "$NAME" --format csv -c s 2>/dev/null | head -n1)"
+if [ "$STATE" = "RUNNING" ]; then
+log "实例 $NAME 已到期($EXPIRE)，正在关机"
+incus stop "$NAME" --timeout 30 >> "$LOG_FILE" 2>&1 || true
+fi
+fi
+printf '%s %s\n' "$NAME" "$EXPIRE" >> "$TMP"
+done < "$DATA_FILE"
+
+mv "$TMP" "$DATA_FILE"
+EXPIRE_EOF
+chmod 750 "$EXPIRE_CHECK_PATH"
+
+echo "==> 写入 systemd service/timer（出站滥用检测）"
 cat > "$SYSTEMD_SERVICE" << SERVICE_EOF
 [Unit]
 Description=Incus outbound abuse guard (scan/crawler/DDoS detection)
@@ -323,7 +370,6 @@ ExecStart=$SCRIPT_PATH
 $( [ "$DRY_RUN_FLAG" = "1" ] && echo "Environment=DRY_RUN=1" )
 SERVICE_EOF
 
-echo "==> 写入 systemd timer（每分钟跑一次）"
 cat > "$SYSTEMD_TIMER" << 'TIMER_EOF'
 [Unit]
 Description=Run incus-guard every minute
@@ -338,8 +384,34 @@ Persistent=true
 WantedBy=timers.target
 TIMER_EOF
 
+echo "==> 写入 systemd service/timer（实例到期检查）"
+cat > "$EXPIRE_SERVICE" << SERVICE_EOF2
+[Unit]
+Description=Incus instance expire checker
+After=network.target
+
+[Service]
+Type=oneshot
+ExecStart=$EXPIRE_CHECK_PATH
+SERVICE_EOF2
+
+cat > "$EXPIRE_TIMER" << 'TIMER_EOF2'
+[Unit]
+Description=Run incus-expire-check every minute
+
+[Timer]
+OnBootSec=30
+OnUnitActiveSec=60
+AccuracySec=5
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+TIMER_EOF2
+
 systemctl daemon-reload
 systemctl enable --now incus-guard.timer
+systemctl enable --now incus-expire.timer
 
 echo "==> 写入 gua 管理命令 $GUA_BIN"
 cat > "$GUA_BIN" << GUA_EOF
@@ -347,9 +419,11 @@ cat > "$GUA_BIN" << GUA_EOF
 set -u
 LOG_DIR="$LOG_DIR"
 LOG="\$LOG_DIR/incus_guard.log"
+EXPIRE_LOG="\$LOG_DIR/incus-expire.log"
 BAN_FILE="/run/incus_guard.bans"
 INSTALLER_PATH="$INSTALLER_PATH"
 REMOTE_INSTALL_URL="$REMOTE_INSTALL_URL"
+EXPIRE_DATA_FILE="$EXPIRE_DATA_FILE"
 
 status_line() {
   if systemctl is-active --quiet incus-guard.timer; then
@@ -363,6 +437,92 @@ pause() {
   read -rp "按回车返回菜单..." _
 }
 
+get_ipv4_for() {
+  incus list "\$1" --format csv -c 4 2>/dev/null | grep -oE '([0-9]{1,3}\.){3}[0-9]{1,3}' | head -n 1
+}
+
+get_expire_for() {
+  local name="\$1"
+  awk -v n="\$name" '\$1 == n { print \$2; exit }' "\$EXPIRE_DATA_FILE" 2>/dev/null
+}
+
+set_expire_for() {
+  local name="\$1" date="\$2" tmp
+  tmp="\$(mktemp)"
+  awk -v n="\$name" '\$1 != n { print }' "\$EXPIRE_DATA_FILE" 2>/dev/null > "\$tmp" || true
+  printf '%s %s\n' "\$name" "\$date" >> "\$tmp"
+  mv "\$tmp" "\$EXPIRE_DATA_FILE"
+}
+
+validate_date() {
+  date -d "\$1" >/dev/null 2>&1
+}
+
+list_instances_table() {
+  local i=1
+  declare -gA IDX_NAME
+  printf "%-4s %-20s %-16s %-12s\n" "编号" "实例名称" "内网IP" "到期时间"
+  echo "--------------------------------------------------------------"
+  while read -r NAME; do
+    [ -z "\$NAME" ] && continue
+    IP="\$(get_ipv4_for "\$NAME")"
+    [ -z "\$IP" ] && IP="无"
+    EXP="\$(get_expire_for "\$NAME")"
+    [ -z "\$EXP" ] && EXP="无"
+    printf "%-4s %-20s %-16s %-12s\n" "\$i" "\$NAME" "\$IP" "\$EXP"
+    IDX_NAME[\$i]="\$NAME"
+    i=\$((i+1))
+  done < <(incus list --format csv -c n 2>/dev/null)
+}
+
+expire_menu() {
+  while true; do
+    clear
+    echo "================================"
+    echo "   实例到期管理"
+    echo "================================"
+    echo "1. 设置主机到期时间"
+    echo "2. 修改到期时间"
+    echo "3. 返回上级菜单"
+    echo "================================"
+    read -rp "请输入选项 [1-3]: " sub_choice
+
+    case "\$sub_choice" in
+      1|2)
+        echo
+        list_instances_table
+        echo
+        total=\$((i-1))
+        read -rp "请输入主机编号 [1-\${#IDX_NAME[@]}]: " num
+        if [ -z "\${IDX_NAME[\$num]:-}" ]; then
+          echo "无效编号"
+          sleep 1
+          continue
+        fi
+        SELECTED_NAME="\${IDX_NAME[\$num]}"
+        echo "已选择主机: \$SELECTED_NAME"
+        read -rp "请输入到期时间 (格式 年/月/日，例如 2026/12/31): " indate
+        norm_date="\$(echo "\$indate" | tr '/' '-')"
+        if ! validate_date "\$norm_date"; then
+          echo "日期格式不正确，请重新操作"
+          sleep 1
+          continue
+        fi
+        set_expire_for "\$SELECTED_NAME" "\$norm_date"
+        echo "已保存: \$SELECTED_NAME -> \$norm_date"
+        pause
+        ;;
+      3)
+        return
+        ;;
+      *)
+        echo "无效选项"
+        sleep 1
+        ;;
+    esac
+  done
+}
+
 while true; do
   clear
   echo "================================"
@@ -371,10 +531,11 @@ while true; do
   echo "================================"
   echo "1. 脚本升级（拉取最新版本并重装）"
   echo "2. 封禁日志"
-  echo "3. 删除脚本（完全卸载）"
-  echo "4. 退出"
+  echo "3. 实例到期管理"
+  echo "4. 删除脚本（完全卸载）"
+  echo "5. 退出"
   echo "================================"
-  read -rp "请输入选项 [1-4]: " choice
+  read -rp "请输入选项 [1-5]: " choice
 
   case "\$choice" in
     1)
@@ -401,6 +562,9 @@ while true; do
       pause
       ;;
     3)
+      expire_menu
+      ;;
+    4)
       read -rp "确认要完全卸载 incus-guard 吗？(y/N): " confirm
       if [ "\$confirm" = "y" ] || [ "\$confirm" = "Y" ]; then
         bash "\$INSTALLER_PATH" --uninstall
@@ -409,7 +573,7 @@ while true; do
         exit 0
       fi
       ;;
-    4)
+    5)
       exit 0
       ;;
     *)
@@ -426,5 +590,6 @@ echo "==> 安装完成"
 [ "$DRY_RUN_FLAG" = "1" ] && echo "  当前为 DRY_RUN 模式：只记日志，不会 freeze/stop/封禁"
 echo "  root 下输入 gua 打开管理面板"
 echo "  状态: systemctl status incus-guard.timer"
+echo "  到期检查状态: systemctl status incus-expire.timer"
 echo "  日志: tail -f $LOG_DIR/incus_guard.log"
 echo "  卸载: sudo bash $INSTALLER_PATH --uninstall"
