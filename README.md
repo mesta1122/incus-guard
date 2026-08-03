@@ -5,7 +5,7 @@ Incudal 一键监测滥用-自动封禁+实例时间管理脚本  请你切一�
 ## 一键安装
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/mesta1122/incus-guard/main/install_incus_guard.sh | sudo bash
+curl -fsSL https://raw.githubusercontent.com/Milk-WX/incus-guard/main/install_incus_guard.sh | sudo bash
 ```
 
 ## 试运行模式
@@ -13,7 +13,7 @@ curl -fsSL https://raw.githubusercontent.com/mesta1122/incus-guard/main/install_
 只记日志，不执行 freeze/stop/封禁：
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/mesta1122/incus-guard/main/install_incus_guard.sh | sudo bash -s -- --dry-run
+curl -fsSL https://raw.githubusercontent.com/Milk-WX/incus-guard/main/install_incus_guard.sh | sudo bash -s -- --dry-run
 ```
 
 ## 管理命令
